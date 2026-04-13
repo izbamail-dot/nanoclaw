@@ -2,10 +2,11 @@ import fs from 'fs';
 import https from 'https';
 import path from 'path';
 
-import { Api, Bot } from 'grammy';
+import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
+import { isTTSTrigger, synthesizeSpeech } from '../transcription.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -51,6 +52,7 @@ export class TelegramChannel implements Channel {
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private ttsMode: Set<string> = new Set();
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
@@ -90,7 +92,10 @@ export class TelegramChannel implements Channel {
       const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const resp = await fetch(fileUrl);
       if (!resp.ok) {
-        logger.warn({ fileId, status: resp.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: resp.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
@@ -211,6 +216,12 @@ export class TelegramChannel implements Channel {
         return;
       }
 
+      // Detect TTS trigger phrase
+      if (isTTSTrigger(content)) {
+        this.ttsMode.add(chatJid);
+        logger.info({ chatJid }, 'TTS mode activated');
+      }
+
       // Deliver message — startMessageLoop() will pick it up
       this.opts.onMessage(chatJid, {
         id: msgId,
@@ -308,11 +319,65 @@ export class TelegramChannel implements Channel {
         filename: `video_${ctx.message.message_id}`,
       });
     });
-    this.bot.on('message:voice', (ctx) => {
-      storeMedia(ctx, '[Voice message]', {
-        fileId: ctx.message.voice?.file_id,
-        filename: `voice_${ctx.message.message_id}`,
-      });
+    this.bot.on('message:voice', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const fileId = ctx.message.voice?.file_id;
+      if (!fileId) {
+        storeMedia(ctx, '[Voice message]');
+        return;
+      }
+
+      // Download voice file to temp path and transcribe
+      try {
+        const file = await this.bot!.api.getFile(fileId);
+        if (!file.file_path) { storeMedia(ctx, '[Voice message]'); return; }
+
+        const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const resp = await fetch(fileUrl);
+        if (!resp.ok) { storeMedia(ctx, '[Voice message]'); return; }
+
+        const os = await import('os');
+        const { execFile } = await import('child_process');
+        const { promisify } = await import('util');
+        const execFileAsync = promisify(execFile);
+        const { fileURLToPath } = await import('url');
+
+        const tmpPath = path.join(os.tmpdir(), `tg_voice_${ctx.message.message_id}.ogg`);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(tmpPath, buf);
+
+        const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
+        const venvPython = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'venv', 'bin', 'python3');
+        const { stdout } = await execFileAsync(venvPython, [
+          path.join(scriptsDir, 'transcribe.py'),
+          tmpPath,
+        ]);
+        fs.unlinkSync(tmpPath);
+
+        const transcript = stdout.trim();
+        if (transcript) {
+          const timestamp = new Date(ctx.message.date * 1000).toISOString();
+          const senderName = ctx.from?.first_name || ctx.from?.username || ctx.from?.id?.toString() || 'Unknown';
+          logger.info({ chatJid, length: transcript.length }, 'Transcribed Telegram voice message');
+          this.opts.onMessage(chatJid, {
+            id: ctx.message.message_id.toString(),
+            chat_jid: chatJid,
+            sender: ctx.from?.id?.toString() || '',
+            sender_name: senderName,
+            content: `[Voice: ${transcript}]`,
+            timestamp,
+            is_from_me: false,
+          });
+        } else {
+          storeMedia(ctx, '[Voice message]');
+        }
+      } catch (err) {
+        logger.error({ err }, 'Telegram voice transcription error');
+        storeMedia(ctx, '[Voice message]');
+      }
     });
     this.bot.on('message:audio', (ctx) => {
       const name =
@@ -374,6 +439,20 @@ export class TelegramChannel implements Channel {
       const options = threadId
         ? { message_thread_id: parseInt(threadId, 10) }
         : {};
+
+      // If TTS mode is active, send voice message then clear the mode
+      if (this.ttsMode.has(jid)) {
+        this.ttsMode.delete(jid);
+        const audioPath = await synthesizeSpeech(text);
+        if (audioPath) {
+          const audioBuffer = fs.readFileSync(audioPath);
+          fs.unlinkSync(audioPath);
+          await this.bot.api.sendVoice(numericId, new InputFile(audioBuffer, 'voice.ogg'), options);
+          logger.info({ jid }, 'Telegram voice message sent (TTS)');
+          return;
+        }
+        logger.warn({ jid }, 'TTS failed, falling back to text');
+      }
 
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
