@@ -17,14 +17,19 @@ import {
   ASSISTANT_NAME,
   STORE_DIR,
 } from '../config.js';
+import pino from 'pino';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { logger } from '../logger.js';
+
+// Baileys requires a pino-compatible logger instance (with .child(), .level, etc.)
+const baileysLogger = pino({ level: 'silent' });
 import {
   isVoiceMessage,
   isTTSTrigger,
   synthesizeSpeech,
   transcribeAudioMessage,
 } from '../transcription.js';
+import { resolveGroupFolderPath } from '../group-folder.js';
 import {
   Channel,
   OnInboundMessage,
@@ -81,10 +86,10 @@ export class WhatsAppChannel implements Channel {
       version,
       auth: {
         creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger as any),
+        keys: makeCacheableSignalKeyStore(state.keys, baileysLogger),
       },
       printQRInTerminal: false,
-      logger: logger as any,
+      logger: baileysLogger,
       browser: Browsers.macOS('Chrome'),
     });
 
@@ -211,9 +216,11 @@ export class WhatsAppChannel implements Channel {
             msg.message?.videoMessage?.caption ||
             '';
 
+          const docMsg = msg.message?.documentMessage;
+
           // Skip protocol messages with no text content (encryption keys, read receipts, etc.)
-          // but allow voice messages through for transcription
-          if (!content && !isVoiceMessage(msg)) continue;
+          // but allow voice and document messages through
+          if (!content && !isVoiceMessage(msg) && !docMsg) continue;
 
           const sender = msg.key.participant || msg.key.remoteJid || '';
           const senderName = msg.pushName || sender.split('@')[0];
@@ -250,6 +257,38 @@ export class WhatsAppChannel implements Channel {
             } catch (err) {
               logger.error({ err }, 'Voice transcription error');
               finalContent = '[Voice Message - transcription failed]';
+            }
+          } else if (docMsg) {
+            // Download document and save to group attachments
+            const filename = docMsg.fileName || `document_${msg.key.id || Date.now()}`;
+            const caption = docMsg.caption ? ` ${docMsg.caption}` : '';
+            try {
+              const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+              const buffer = (await downloadMediaMessage(
+                msg,
+                'buffer',
+                {},
+                {
+                  logger: console as any,
+                  reuploadRequest: this.sock.updateMediaMessage,
+                },
+              )) as Buffer;
+
+              if (buffer && buffer.length > 0) {
+                const group = groups[chatJid];
+                const groupDir = resolveGroupFolderPath(group.folder);
+                const attachDir = path.join(groupDir, 'attachments');
+                fs.mkdirSync(attachDir, { recursive: true });
+                const safeName = filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+                fs.writeFileSync(path.join(attachDir, safeName), buffer);
+                finalContent = `[Document: ${filename}] (/workspace/group/attachments/${safeName})${caption}`;
+                logger.info({ chatJid, filename, bytes: buffer.length }, 'Downloaded WhatsApp document');
+              } else {
+                finalContent = `[Document: ${filename}]${caption}`;
+              }
+            } catch (err) {
+              logger.error({ err, filename }, 'Failed to download WhatsApp document');
+              finalContent = `[Document: ${filename}]${caption}`;
             }
           }
 
@@ -392,7 +431,9 @@ export class WhatsAppChannel implements Channel {
 
     // Query Baileys' signal repository for the mapping
     try {
-      const pn = await (this.sock.signalRepository as any)?.lidMapping?.getPNForLID(jid);
+      const pn = await (
+        this.sock.signalRepository as any
+      )?.lidMapping?.getPNForLID(jid);
       if (pn) {
         const phoneJid = `${pn.split('@')[0].split(':')[0]}@s.whatsapp.net`;
         this.lidToPhoneMap[lidUser] = phoneJid;

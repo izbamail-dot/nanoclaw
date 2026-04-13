@@ -31,7 +31,7 @@ export function isTTSTrigger(text: string): boolean {
   return TTS_TRIGGERS.some((t) => lower.includes(t));
 }
 
-async function transcribeWithLocalWhisper(
+export async function transcribeWithLocalWhisper(
   audioBuffer: Buffer,
 ): Promise<string | null> {
   const tmpFile = path.join(os.tmpdir(), `voice_${Date.now()}.ogg`);

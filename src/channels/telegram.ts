@@ -6,7 +6,7 @@ import { Api, Bot, InputFile } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
-import { isTTSTrigger, synthesizeSpeech } from '../transcription.js';
+import { isTTSTrigger, synthesizeSpeech, transcribeWithLocalWhisper } from '../transcription.js';
 import { resolveGroupFolderPath } from '../group-folder.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -333,35 +333,31 @@ export class TelegramChannel implements Channel {
       // Download voice file to temp path and transcribe
       try {
         const file = await this.bot!.api.getFile(fileId);
-        if (!file.file_path) { storeMedia(ctx, '[Voice message]'); return; }
+        if (!file.file_path) {
+          storeMedia(ctx, '[Voice message]');
+          return;
+        }
 
         const fileUrl = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
         const resp = await fetch(fileUrl);
-        if (!resp.ok) { storeMedia(ctx, '[Voice message]'); return; }
+        if (!resp.ok) {
+          storeMedia(ctx, '[Voice message]');
+          return;
+        }
 
-        const os = await import('os');
-        const { execFile } = await import('child_process');
-        const { promisify } = await import('util');
-        const execFileAsync = promisify(execFile);
-        const { fileURLToPath } = await import('url');
-
-        const tmpPath = path.join(os.tmpdir(), `tg_voice_${ctx.message.message_id}.ogg`);
         const buf = Buffer.from(await resp.arrayBuffer());
-        fs.writeFileSync(tmpPath, buf);
-
-        const scriptsDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts');
-        const venvPython = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'venv', 'bin', 'python3');
-        const { stdout } = await execFileAsync(venvPython, [
-          path.join(scriptsDir, 'transcribe.py'),
-          tmpPath,
-        ]);
-        fs.unlinkSync(tmpPath);
-
-        const transcript = stdout.trim();
+        const transcript = await transcribeWithLocalWhisper(buf);
         if (transcript) {
           const timestamp = new Date(ctx.message.date * 1000).toISOString();
-          const senderName = ctx.from?.first_name || ctx.from?.username || ctx.from?.id?.toString() || 'Unknown';
-          logger.info({ chatJid, length: transcript.length }, 'Transcribed Telegram voice message');
+          const senderName =
+            ctx.from?.first_name ||
+            ctx.from?.username ||
+            ctx.from?.id?.toString() ||
+            'Unknown';
+          logger.info(
+            { chatJid, length: transcript.length },
+            'Transcribed Telegram voice message',
+          );
           this.opts.onMessage(chatJid, {
             id: ctx.message.message_id.toString(),
             chat_jid: chatJid,
@@ -447,7 +443,11 @@ export class TelegramChannel implements Channel {
         if (audioPath) {
           const audioBuffer = fs.readFileSync(audioPath);
           fs.unlinkSync(audioPath);
-          await this.bot.api.sendVoice(numericId, new InputFile(audioBuffer, 'voice.ogg'), options);
+          await this.bot.api.sendVoice(
+            numericId,
+            new InputFile(audioBuffer, 'voice.ogg'),
+            options,
+          );
           logger.info({ jid }, 'Telegram voice message sent (TTS)');
           return;
         }

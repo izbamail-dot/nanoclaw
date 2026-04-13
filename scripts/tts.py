@@ -8,7 +8,19 @@ Writes OGG opus audio to output_file (suitable for WhatsApp/Telegram voice messa
 import sys
 import os
 import subprocess
-import tempfile
+
+def _find_ffmpeg():
+    candidates = [
+        os.path.expanduser('~/.local/bin/ffmpeg'),
+        '/usr/bin/ffmpeg',
+        '/usr/local/bin/ffmpeg',
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return 'ffmpeg'
+
+FFMPEG = _find_ffmpeg()
 
 MODELS_DIR = os.path.join(os.path.dirname(__file__), '..', 'data', 'models', 'piper')
 VOICE_MODEL = os.path.join(MODELS_DIR, 'ru_RU-irina-medium.onnx')
@@ -35,7 +47,7 @@ def synthesize(text: str, output_path: str) -> None:
 
         # Convert to OGG opus for WhatsApp/Telegram voice messages
         subprocess.run(
-            ['ffmpeg', '-y', '-i', wav_path, '-c:a', 'libopus', '-b:a', '32k', output_path],
+            [FFMPEG, '-y', '-i', wav_path, '-c:a', 'libopus', '-b:a', '32k', output_path],
             check=True, capture_output=True
         )
     finally:
